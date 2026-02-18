@@ -6,11 +6,9 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
-use base64::Engine;
 use clap::{Parser, Subcommand};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
-use rand::RngCore;
 use tokio::process::Command;
 
 const RUN_DIR: &str = "/run/qgui";
@@ -79,10 +77,6 @@ struct UpArgs {
     /// noVNC web root directory (contains vnc.html, app/, etc)
     #[arg(long, default_value = "/usr/share/novnc")]
     novnc_web_root: String,
-
-    /// Where to store the generated password (0600). Format is x11vnc -storepasswd output.
-    #[arg(long, default_value = "/var/lib/qgui/vnc.pass")]
-    password_file: String,
 
     /// Wait for readiness (TCP listen on novnc_port) for up to N seconds.
     #[arg(long, default_value_t = 10)]
@@ -187,12 +181,6 @@ async fn spawn_logged(name: &str, mut cmd: Command, extra_env: &[(&str, &str)]) 
     Ok(pid)
 }
 
-fn generate_password() -> String {
-    let mut bytes = [0u8; 24];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    base64::engine::general_purpose::STANDARD_NO_PAD.encode(bytes)
-}
-
 async fn cmd_up(args: UpArgs) -> Result<()> {
     ensure_dirs()?;
 
@@ -229,28 +217,6 @@ async fn cmd_up(args: UpArgs) -> Result<()> {
     };
     write_pid("xvfb", xvfb_pid)?;
 
-    // Prepare VNC password file using x11vnc itself (rfbauth format).
-    let pass_path = PathBuf::from(&args.password_file);
-    if !pass_path.exists() {
-        let pw = generate_password();
-        fs::create_dir_all(pass_path.parent().unwrap_or_else(|| Path::new(DATA_DIR))).ok();
-        let status = std::process::Command::new("x11vnc")
-            .arg("-storepasswd")
-            .arg(&pw)
-            .arg(&args.password_file)
-            .status()
-            .context("x11vnc -storepasswd")?;
-        if !status.success() {
-            return Err(anyhow!("failed to generate VNC password file"));
-        }
-        // Restrict perms.
-        let _ = std::process::Command::new("chmod")
-            .arg("0600")
-            .arg(&args.password_file)
-            .status();
-        eprintln!("qgui: generated password stored at {}", args.password_file);
-    }
-
     // XFCE session
     let xfce_pid = {
         let cmd = Command::new("startxfce4");
@@ -272,8 +238,7 @@ async fn cmd_up(args: UpArgs) -> Result<()> {
             .arg(&args.vnc_bind)
             .arg("-rfbport")
             .arg(args.vnc_port.to_string())
-            .arg("-rfbauth")
-            .arg(&args.password_file)
+            .arg("-nopw")
             .arg("-forever")
             .arg("-shared")
             .arg("-repeat")
@@ -314,7 +279,6 @@ async fn cmd_up(args: UpArgs) -> Result<()> {
                 "qgui: novnc          {}:{}  (enabled)",
                 args.novnc_bind, args.novnc_port
             );
-            println!("qgui: password_file  {}", args.password_file);
             println!("qgui: ready");
             return Ok(());
         }

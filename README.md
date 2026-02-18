@@ -28,7 +28,7 @@ Defaults:
 - Desktop is on `DISPLAY=:1` at `1920x1080x24`
 - VNC listens on `127.0.0.1:5901` (loopback by default)
 - noVNC listens on `0.0.0.0:6080` (so an internal reverse proxy can reach it)
-- VNC auth is always enabled; `qgui` generates an `x11vnc` password file if missing
+- VNC auth is disabled by default (`x11vnc -nopw`)
 
 ## Rootfs / Image Build
 
@@ -48,4 +48,3 @@ contains the GUI stack plus a static `qgui` binary:
 ## License
 
 Dual-licensed under MIT or Apache-2.0.
-
