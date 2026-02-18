@@ -1,0 +1,30 @@
+[package]
+name = "qgui"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Container GUI orchestrator (Xvfb + XFCE + VNC + noVNC)"
+repository = "https://github.com/ariacomputecompany/qgui"
+
+[[bin]]
+name = "qgui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.21"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4.0", features = ["derive"] }
+nix = { version = "0.26.1", features = ["process"] }
+rand = "0.8"
+tokio = { version = "1.21.2", features = ["rt-multi-thread", "macros", "time", "process"] }
+which = "4.4"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+debug = false
+
