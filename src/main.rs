@@ -234,13 +234,12 @@ async fn cmd_up(args: UpArgs) -> Result<()> {
         let mut cmd = Command::new("x11vnc");
         cmd.arg("-display")
             .arg(&display)
-            .arg("-rfbaddr")
-            .arg(&args.vnc_bind)
             .arg("-rfbport")
             .arg(args.vnc_port.to_string())
             .arg("-nopw")
             .arg("-forever")
             .arg("-shared")
+            .arg("-loop")
             .arg("-repeat")
             .arg("-noxdamage");
         spawn_logged("x11vnc", cmd, &[("DISPLAY", display.as_str())]).await?
