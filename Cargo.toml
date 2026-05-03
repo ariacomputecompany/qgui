@@ -3,7 +3,7 @@ name = "qgui"
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "Container GUI orchestrator (Xvfb + XFCE + VNC + noVNC)"
+description = "Container GUI orchestrator (KasmVNC + XFCE)"
 repository = "https://github.com/ariacomputecompany/qgui"
 
 [[bin]]
@@ -16,9 +16,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4.0", features = ["derive"] }
 libc = "0.2"
 nix = { version = "0.26.1", features = ["process"] }
+rand = "0.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1.21.2", features = ["rt-multi-thread", "macros", "time", "process", "signal"] }
+tokio = { version = "1.21.2", features = ["rt-multi-thread", "macros", "time", "process", "signal", "io-util"] }
 which = "4.4"
 
 [profile.release]

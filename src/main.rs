@@ -11,22 +11,27 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
-use serde::{Deserialize, Serialize};
+use rand::{distributions::Alphanumeric, Rng};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+
+mod gui_backend_contract;
+
+use gui_backend_contract::GuiSessionState as SessionState;
 
 const RUN_DIR: &str = "/run/qgui";
 const DATA_DIR: &str = "/var/lib/qgui";
 const DEFAULT_DISPLAY: &str = ":1";
-const DEFAULT_RES: &str = "1920x1080";
+const DEFAULT_RES: &str = "1440x900";
 const DEFAULT_DEPTH: u16 = 24;
-const DEFAULT_VNC_PORT: u16 = 5901;
-const DEFAULT_NOVNC_PORT: u16 = 6080;
+const DEFAULT_BACKEND_PORT: u16 = 6080;
+const DEFAULT_BACKEND_USER: &str = "quilt";
 
 #[derive(Debug, Parser)]
 #[command(
     name = "qgui",
     version,
-    about = "Quilt GUI session manager (Xvfb + XFCE + VNC + noVNC)"
+    about = "Quilt GUI session manager (KasmVNC + XFCE)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -53,30 +58,38 @@ enum Cmd {
 
 #[derive(Debug, Clone, Args)]
 struct UpArgs {
+    /// X display to use (e.g. :1)
     #[arg(long, default_value = DEFAULT_DISPLAY)]
     display: String,
+
+    /// Screen resolution (e.g. 1440x900)
     #[arg(long, default_value = DEFAULT_RES)]
     res: String,
+
+    /// Color depth (bits per pixel)
     #[arg(long, default_value_t = DEFAULT_DEPTH)]
     depth: u16,
-    #[arg(long, default_value = "127.0.0.1")]
-    vnc_bind: String,
-    #[arg(long, default_value_t = DEFAULT_VNC_PORT)]
-    vnc_port: u16,
+
+    /// KasmVNC bind address
     #[arg(long, default_value = "0.0.0.0")]
-    novnc_bind: String,
-    #[arg(long, default_value_t = DEFAULT_NOVNC_PORT)]
-    novnc_port: u16,
-    #[arg(long, default_value = "/usr/share/novnc")]
-    novnc_web_root: String,
-    #[arg(long, default_value_t = 10)]
+    bind: String,
+
+    /// KasmVNC browser port
+    #[arg(long, default_value_t = DEFAULT_BACKEND_PORT)]
+    port: u16,
+
+    /// Wait for readiness for up to N seconds.
+    #[arg(long, default_value_t = 15)]
     wait_ready_secs: u64,
 }
 
 #[derive(Debug, Parser)]
 struct LogsArgs {
-    #[arg(long, default_value = "websockify")]
+    /// Component to show logs for: kasmvnc, dbus
+    #[arg(long, default_value = "kasmvnc")]
     component: String,
+
+    /// Number of bytes from end of file.
     #[arg(long, default_value_t = 32_768)]
     tail_bytes: usize,
 }
@@ -89,29 +102,16 @@ enum EnvFormat {
 
 #[derive(Debug, Parser)]
 struct EnvArgs {
+    /// Output format.
     #[arg(long, value_enum, default_value_t = EnvFormat::Shell)]
     format: EnvFormat,
 }
 
 #[derive(Debug, Parser)]
 struct RunArgs {
+    /// Command to run inside the active GUI session.
     #[arg(required = true, trailing_var_arg = true)]
     command: Vec<OsString>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SessionState {
-    display: String,
-    res: String,
-    depth: u16,
-    vnc_bind: String,
-    vnc_port: u16,
-    novnc_bind: String,
-    novnc_port: u16,
-    novnc_web_root: String,
-    dbus_addr: String,
-    dbus_socket: String,
-    xdg_runtime_dir: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,6 +156,7 @@ fn ensure_dirs() -> Result<()> {
     fs::create_dir_all(RUN_DIR).context("create /run/qgui")?;
     fs::create_dir_all(DATA_DIR).context("create /var/lib/qgui")?;
     fs::create_dir_all(Path::new(DATA_DIR).join("logs")).context("create /var/lib/qgui/logs")?;
+    fs::create_dir_all(vnc_dir()).context("create ~/.vnc")?;
     Ok(())
 }
 
@@ -171,6 +172,22 @@ fn log_path(name: &str) -> PathBuf {
     Path::new(DATA_DIR)
         .join("logs")
         .join(format!("{}.log", name))
+}
+
+fn vnc_dir() -> PathBuf {
+    Path::new("/root/.vnc").to_path_buf()
+}
+
+fn kasmvnc_config_path() -> PathBuf {
+    Path::new(RUN_DIR).join("kasmvnc.yaml")
+}
+
+fn kasmvnc_passwd_path() -> PathBuf {
+    Path::new("/root/.kasmpasswd").to_path_buf()
+}
+
+fn xstartup_path() -> PathBuf {
+    Path::new(RUN_DIR).join("xstartup")
 }
 
 fn write_state(state: &SessionState) -> Result<()> {
@@ -209,7 +226,13 @@ fn process_alive(pid: u32) -> bool {
 }
 
 fn tcp_listening(addr: &str, port: u16) -> bool {
-    (addr, port)
+    let connect_addr = match addr {
+        "0.0.0.0" => "127.0.0.1",
+        "::" | "[::]" => "::1",
+        _ => addr,
+    };
+
+    (connect_addr, port)
         .to_socket_addrs()
         .ok()
         .into_iter()
@@ -287,18 +310,17 @@ async fn wait_for_display_ready(display: &str, timeout: Duration) -> Result<()> 
 }
 
 fn component_reports() -> Result<Vec<ComponentReport>> {
-    ["xvfb", "xfce", "x11vnc", "websockify"]
-        .into_iter()
-        .map(|name| {
-            let pid = read_pid(name)?;
-            let state = match pid {
-                Some(pid) if process_alive(pid) => HealthState::Running,
-                Some(_) => HealthState::Dead,
-                None => HealthState::Missing,
-            };
-            Ok(ComponentReport { name, pid, state })
-        })
-        .collect()
+    ["kasmvnc"].into_iter().map(component_report).collect()
+}
+
+fn component_report(name: &'static str) -> Result<ComponentReport> {
+    let pid = read_pid(name)?;
+    let state = match pid {
+        Some(pid) if process_alive(pid) => HealthState::Running,
+        Some(_) => HealthState::Dead,
+        None => HealthState::Missing,
+    };
+    Ok(ComponentReport { name, pid, state })
 }
 
 fn first_failed_component() -> Result<Option<&'static str>> {
@@ -322,10 +344,10 @@ fn session_env_pairs(state: &SessionState) -> [(&'static str, &str); 4] {
 fn require_active_session_state() -> Result<SessionState> {
     let state = load_state().context("no active qgui session; run `qgui up` first")?;
     let reports = component_reports()?;
-    let first_bad = reports
+    if let Some(report) = reports
         .into_iter()
-        .find(|report| report.state != HealthState::Running);
-    if let Some(report) = first_bad {
+        .find(|report| report.state != HealthState::Running)
+    {
         bail!(
             "qgui session is not usable: component '{}' is {}",
             report.name,
@@ -338,18 +360,11 @@ fn require_active_session_state() -> Result<SessionState> {
             state.dbus_socket
         );
     }
-    if !tcp_listening(&state.vnc_bind, state.vnc_port) {
+    if !tcp_listening(&state.backend_bind, state.backend_port) {
         bail!(
-            "qgui session is not usable: VNC is not listening on {}:{}",
-            state.vnc_bind,
-            state.vnc_port
-        );
-    }
-    if !tcp_listening(&state.novnc_bind, state.novnc_port) {
-        bail!(
-            "qgui session is not usable: noVNC/websockify is not listening on {}:{}",
-            state.novnc_bind,
-            state.novnc_port
+            "qgui session is not usable: KasmVNC is not listening on {}:{}",
+            state.backend_bind,
+            state.backend_port
         );
     }
     Ok(state)
@@ -379,16 +394,6 @@ fn validate_resolution(res: &str) -> Result<()> {
     Ok(())
 }
 
-fn no_vnc_root_checks(web_root: &Path) -> Result<()> {
-    for required in ["vnc.html", "app/ui.js", "app/images"] {
-        let path = web_root.join(required);
-        if !path.exists() {
-            bail!("missing noVNC asset: {}", path.display());
-        }
-    }
-    Ok(())
-}
-
 fn file_descriptor_limit() -> Result<u64> {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
@@ -404,10 +409,9 @@ fn file_descriptor_limit() -> Result<u64> {
 fn run_doctor(check_ports: bool) -> Result<()> {
     ensure_dirs()?;
     for bin in [
-        "Xvfb",
+        "kasmvncserver",
+        "kasmvncpasswd",
         "xfce4-session",
-        "x11vnc",
-        "websockify",
         "dbus-daemon",
         "xrdb",
         "xauth",
@@ -427,7 +431,11 @@ fn run_doctor(check_ports: bool) -> Result<()> {
     let run_dir = Path::new(RUN_DIR);
     ensure_runtime_dir(run_dir)?;
     ensure_runtime_dir(&Path::new(RUN_DIR).join("xdg-runtime"))?;
-    no_vnc_root_checks(Path::new("/usr/share/novnc"))?;
+    ensure_runtime_dir(&vnc_dir())?;
+    let web_root = Path::new("/usr/share/kasmvnc/www/index.html");
+    if !web_root.exists() {
+        bail!("missing KasmVNC web asset: {}", web_root.display());
+    }
 
     if let Some(lock_path) = display_lock_path(DEFAULT_DISPLAY) {
         let socket_path = display_socket_path(DEFAULT_DISPLAY).unwrap_or_default();
@@ -441,11 +449,95 @@ fn run_doctor(check_ports: bool) -> Result<()> {
 
     if check_ports {
         let state = require_active_session_state()?;
-        if !Path::new(&state.novnc_web_root).exists() {
-            bail!("noVNC web root missing at {}", state.novnc_web_root);
+        if state.auth_username.is_empty() || state.auth_password.is_empty() {
+            bail!("qgui session is missing backend auth state");
         }
     }
 
+    Ok(())
+}
+
+fn generate_backend_password() -> String {
+    rand::thread_rng()
+        .sample_iter(&Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect()
+}
+
+fn write_kasmvnc_config(args: &UpArgs) -> Result<PathBuf> {
+    let config_path = kasmvnc_config_path();
+    let config = format!(
+        "desktop:\n  resolution:\n    width: {width}\n    height: {height}\n  allow_resize: true\n  pixel_depth: {depth}\nnetwork:\n  protocol: http\n  interface: {bind}\n  websocket_port: {port}\n  ssl:\n    require_ssl: false\n  udp:\n    public_ip: 127.0.0.1\ncommand_line:\n  prompt: false\n",
+        width = args
+            .res
+            .split_once('x')
+            .ok_or_else(|| anyhow!("resolution must be WIDTHxHEIGHT"))?
+            .0,
+        height = args
+            .res
+            .split_once('x')
+            .ok_or_else(|| anyhow!("resolution must be WIDTHxHEIGHT"))?
+            .1,
+        depth = args.depth,
+        bind = args.bind,
+        port = args.port,
+    );
+    fs::write(&config_path, config).with_context(|| format!("write {}", config_path.display()))?;
+    Ok(config_path)
+}
+
+fn write_xstartup(state: &SessionState) -> Result<PathBuf> {
+    let path = xstartup_path();
+    let contents = format!(
+        "#!/bin/sh\nexport DISPLAY={display}\nexport DBUS_SESSION_BUS_ADDRESS={dbus}\nexport XDG_RUNTIME_DIR={xdg}\nexport QT_X11_NO_MITSHM=1\nexec xfce4-session\n",
+        display = shell_escape(&state.display),
+        dbus = shell_escape(&state.dbus_addr),
+        xdg = shell_escape(&state.xdg_runtime_dir),
+    );
+    fs::write(&path, contents).with_context(|| format!("write {}", path.display()))?;
+    let mut perms = fs::metadata(&path)
+        .with_context(|| format!("stat {}", path.display()))?
+        .permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&path, perms).with_context(|| format!("chmod {}", path.display()))?;
+    Ok(path)
+}
+
+async fn configure_backend_auth(state: &SessionState) -> Result<()> {
+    let passwd_path = kasmvnc_passwd_path();
+    let _ = fs::remove_file(&passwd_path);
+
+    let mut cmd = Command::new("kasmvncpasswd");
+    cmd.arg(&passwd_path)
+        .arg("-u")
+        .arg(&state.auth_username)
+        .arg("-w")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().context("spawn kasmvncpasswd")?;
+    {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("kasmvncpasswd stdin unavailable"))?;
+        let payload = format!("{}\n{}\n", state.auth_password, state.auth_password);
+        stdin
+            .write_all(payload.as_bytes())
+            .await
+            .context("write kasmvncpasswd input")?;
+    }
+    let output = child
+        .wait_with_output()
+        .await
+        .context("wait for kasmvncpasswd")?;
+    if !output.status.success() {
+        bail!(
+            "kasmvncpasswd failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
     Ok(())
 }
 
@@ -461,6 +553,7 @@ async fn start_stack(args: &UpArgs) -> Result<SessionState> {
     let dbus_addr = format!("unix:path={}", dbus_sock.display());
     let xdg_runtime_dir = Path::new(RUN_DIR).join("xdg-runtime");
     ensure_runtime_dir(&xdg_runtime_dir)?;
+    ensure_runtime_dir(&vnc_dir())?;
 
     {
         let mut cmd = Command::new("dbus-daemon");
@@ -472,96 +565,56 @@ async fn start_stack(args: &UpArgs) -> Result<SessionState> {
         let _ = spawn_logged("dbus", cmd, &[]).await?;
     }
 
-    let xvfb_pid = {
-        let mut cmd = Command::new("Xvfb");
-        cmd.arg(&display)
-            .arg("-screen")
-            .arg("0")
-            .arg(format!("{}x{}", args.res, args.depth))
-            .arg("-nolisten")
-            .arg("tcp");
-        spawn_logged("xvfb", cmd, &[]).await?
-    };
-    write_pid("xvfb", xvfb_pid)?;
-    wait_for_display_ready(&display, Duration::from_secs(5)).await?;
-
     let state = SessionState {
         display: display.clone(),
         res: args.res.clone(),
         depth: args.depth,
-        vnc_bind: args.vnc_bind.clone(),
-        vnc_port: args.vnc_port,
-        novnc_bind: args.novnc_bind.clone(),
-        novnc_port: args.novnc_port,
-        novnc_web_root: args.novnc_web_root.clone(),
+        backend_bind: args.bind.clone(),
+        backend_port: args.port,
         dbus_addr: dbus_addr.clone(),
         dbus_socket: dbus_sock.display().to_string(),
         xdg_runtime_dir: xdg_runtime_dir.display().to_string(),
+        auth_username: DEFAULT_BACKEND_USER.to_string(),
+        auth_password: generate_backend_password(),
     };
 
-    let xfce_pid = {
-        let cmd = Command::new("xfce4-session");
+    configure_backend_auth(&state).await?;
+    let config_path = write_kasmvnc_config(args)?;
+    let xstartup = write_xstartup(&state)?;
+
+    let kasmvnc_pid = {
+        let mut cmd = Command::new("kasmvncserver");
+        cmd.arg(&display)
+            .arg("-fg")
+            .arg("-geometry")
+            .arg(&args.res)
+            .arg("-depth")
+            .arg(args.depth.to_string())
+            .arg("-xstartup")
+            .arg(&xstartup)
+            .arg("-interface")
+            .arg(&args.bind)
+            .arg("-websocketPort")
+            .arg(args.port.to_string())
+            .arg("-config")
+            .arg(&config_path);
         let envs = session_env_pairs(&state);
-        spawn_logged("xfce", cmd, &envs).await?
+        spawn_logged("kasmvnc", cmd, &envs).await?
     };
-    write_pid("xfce", xfce_pid)?;
+    write_pid("kasmvnc", kasmvnc_pid)?;
 
-    let vnc_pid = {
-        let mut cmd = Command::new("x11vnc");
-        cmd.arg("-display")
-            .arg(&display)
-            .arg("-rfbport")
-            .arg(args.vnc_port.to_string())
-            .arg("-nopw")
-            .arg("-forever")
-            .arg("-shared")
-            .arg("-loop")
-            .arg("-repeat")
-            .arg("-noxdamage");
-        if args.vnc_bind == "127.0.0.1" || args.vnc_bind == "localhost" {
-            cmd.arg("-localhost");
-        } else {
-            cmd.arg("-listen").arg(&args.vnc_bind);
-        }
-        let envs = session_env_pairs(&state);
-        spawn_logged("x11vnc", cmd, &envs).await?
-    };
-    write_pid("x11vnc", vnc_pid)?;
-
-    let ws_pid = {
-        let web_root = args.novnc_web_root.clone();
-        let web_root_path = Path::new(&web_root);
-        if !web_root_path.exists() {
-            return Err(anyhow!(
-                "noVNC web root not found at {} (expected vnc.html)",
-                web_root
-            ));
-        }
-        no_vnc_root_checks(web_root_path)?;
-        let mut cmd = Command::new("websockify");
-        cmd.arg("--web")
-            .arg(&web_root)
-            .arg(format!("{}:{}", args.novnc_bind, args.novnc_port))
-            .arg(format!("{}:{}", args.vnc_bind, args.vnc_port));
-        spawn_logged("websockify", cmd, &[]).await?
-    };
-    write_pid("websockify", ws_pid)?;
+    wait_for_display_ready(&display, Duration::from_secs(10)).await?;
 
     let deadline = Instant::now() + Duration::from_secs(args.wait_ready_secs);
     while Instant::now() < deadline {
-        let novnc_ready = tcp_listening(&args.novnc_bind, args.novnc_port);
-        let vnc_ready = tcp_listening(&args.vnc_bind, args.vnc_port);
-        if novnc_ready && vnc_ready && Path::new(&state.dbus_socket).exists() {
+        let backend_ready = tcp_listening(&args.bind, args.port);
+        if backend_ready && Path::new(&state.dbus_socket).exists() {
             write_state(&state)?;
             println!("qgui: display        {}", state.display);
-            println!("qgui: resolution     {}x{}", state.res, state.depth);
+            println!("qgui: resolution     {} depth={}", state.res, state.depth);
             println!(
-                "qgui: vnc            {}:{}  (loopback-only, proxy auth)",
-                state.vnc_bind, state.vnc_port
-            );
-            println!(
-                "qgui: novnc          {}:{}  (enabled)",
-                state.novnc_bind, state.novnc_port
+                "qgui: kasmvnc        {}:{}  (browser backend)",
+                state.backend_bind, state.backend_port
             );
             println!("qgui: dbus           {}", state.dbus_socket);
             println!("qgui: xdg_runtime    {}", state.xdg_runtime_dir);
@@ -572,11 +625,9 @@ async fn start_stack(args: &UpArgs) -> Result<SessionState> {
     }
 
     Err(anyhow!(
-        "qgui up: timed out waiting for full GUI readiness on noVNC {}:{} and VNC {}:{}",
-        args.novnc_bind,
-        args.novnc_port,
-        args.vnc_bind,
-        args.vnc_port
+        "qgui up: timed out waiting for KasmVNC on {}:{}",
+        args.bind,
+        args.port
     ))
 }
 
@@ -614,6 +665,15 @@ async fn cmd_up(args: UpArgs) -> Result<()> {
     }
 }
 
+fn kill_kasmvnc_display(display: &str) {
+    let _ = std::process::Command::new("kasmvncserver")
+        .arg("-kill")
+        .arg(display)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 fn cmd_down() -> Result<()> {
     ensure_dirs()?;
     let display = load_state()
@@ -621,7 +681,9 @@ fn cmd_down() -> Result<()> {
         .map(|state| state.display)
         .unwrap_or_else(|| DEFAULT_DISPLAY.to_string());
 
-    for name in ["websockify", "x11vnc", "xfce", "xvfb"] {
+    kill_kasmvnc_display(&display);
+
+    for name in ["kasmvnc"] {
         if let Some(pid) = read_pid(name)? {
             if process_alive(pid) {
                 let _ = kill_pid(pid, Signal::SIGTERM);
@@ -636,6 +698,9 @@ fn cmd_down() -> Result<()> {
 
     let _ = fs::remove_file(Path::new(RUN_DIR).join("dbus.sock"));
     let _ = fs::remove_file(state_path());
+    let _ = fs::remove_file(kasmvnc_config_path());
+    let _ = fs::remove_file(kasmvnc_passwd_path());
+    let _ = fs::remove_file(xstartup_path());
     if let Some(socket) = display_socket_path(&display) {
         if !socket.exists() {
             clear_display_artifacts(&display);
@@ -656,16 +721,10 @@ fn cmd_status() -> Result<()> {
         );
         println!("qgui: dbus_socket={}", state.dbus_socket);
         println!("qgui: xdg_runtime_dir={}", state.xdg_runtime_dir);
-        println!("qgui: novnc_web_root={}", state.novnc_web_root);
         println!(
-            "qgui: vnc={} reachable={}",
-            format!("{}:{}", state.vnc_bind, state.vnc_port),
-            tcp_listening(&state.vnc_bind, state.vnc_port)
-        );
-        println!(
-            "qgui: novnc={} reachable={}",
-            format!("{}:{}", state.novnc_bind, state.novnc_port),
-            tcp_listening(&state.novnc_bind, state.novnc_port)
+            "qgui: kasmvnc={} reachable={}",
+            format!("{}:{}", state.backend_bind, state.backend_port),
+            tcp_listening(&state.backend_bind, state.backend_port)
         );
     } else {
         println!("qgui: session=missing");
@@ -754,10 +813,12 @@ fn cmd_doctor() -> Result<()> {
 }
 
 fn shell_escape(value: &str) -> String {
-    if value
-        .bytes()
-        .all(|byte| matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'/' | b':' | b'.' | b'-'))
-    {
+    if value.bytes().all(|byte| {
+        matches!(
+            byte,
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_' | b'/' | b':' | b'.' | b'-'
+        )
+    }) {
         value.to_string()
     } else {
         format!("'{}'", value.replace('\'', "'\"'\"'"))
@@ -785,21 +846,21 @@ fn exit_with_status(status: ExitStatus) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{session_env_pairs, shell_escape, SessionState};
+    use super::{session_env_pairs, shell_escape, Cli, SessionState};
+    use clap::CommandFactory;
 
     fn test_state() -> SessionState {
         SessionState {
             display: ":1".to_string(),
-            res: "1920x1080".to_string(),
+            res: "1440x900".to_string(),
             depth: 24,
-            vnc_bind: "127.0.0.1".to_string(),
-            vnc_port: 5901,
-            novnc_bind: "0.0.0.0".to_string(),
-            novnc_port: 6080,
-            novnc_web_root: "/usr/share/novnc".to_string(),
+            backend_bind: "0.0.0.0".to_string(),
+            backend_port: 6080,
             dbus_addr: "unix:path=/run/qgui/dbus.sock".to_string(),
             dbus_socket: "/run/qgui/dbus.sock".to_string(),
             xdg_runtime_dir: "/run/qgui/xdg-runtime".to_string(),
+            auth_username: "quilt".to_string(),
+            auth_password: "secret".to_string(),
         }
     }
 
@@ -820,5 +881,19 @@ mod tests {
     fn shell_escape_quotes_when_needed() {
         assert_eq!(shell_escape("/run/qgui/dbus.sock"), "/run/qgui/dbus.sock");
         assert_eq!(shell_escape("hello world"), "'hello world'");
+    }
+
+    #[test]
+    fn cli_exposes_managed_session_subcommands() {
+        let command = Cli::command();
+        let subcommands: Vec<String> = command
+            .get_subcommands()
+            .map(|subcommand| subcommand.get_name().to_string())
+            .collect();
+
+        assert!(subcommands.iter().any(|name| name == "up"));
+        assert!(subcommands.iter().any(|name| name == "env"));
+        assert!(subcommands.iter().any(|name| name == "run"));
+        assert!(subcommands.iter().any(|name| name == "doctor"));
     }
 }
